@@ -696,11 +696,18 @@ public:
   void generateUnsymbolizedProfile() override;
 
 private:
+  struct FunctionTraceStats {
+    uint64_t TotalSamples = 0;
+    uint64_t BogusSamples = 0;
+  };
+
   // Unwind the hybrid samples after aggregration
   void unwindSamples();
+  void warnBogusTraceHotness();
 
   uint64_t NumBogusTrace = 0;
   uint64_t NumTotalHybridSample = 0;
+  DenseMap<const BinaryFunction *, FunctionTraceStats> FunctionTraceStatsMap;
 };
 
 /*

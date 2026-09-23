@@ -14,12 +14,14 @@
 #include "llvm/ProfileData/ETMTraceDecoder.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LineIterator.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/Timer.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Triple.h"
+#include <array>
 
 #define DEBUG_TYPE "perf-reader"
 
@@ -717,10 +719,6 @@ void HybridPerfReader::unwindSamples() {
                      Unwinder.NumExtCallBranch,
                      "of artificial call branches but doesn't have an external "
                      "frame to match.");
-
-  emitWarningSummary(NumBogusTrace, NumTotalHybridSample,
-                     "of hybrid samples had a callchain leaf that disagreed "
-                     "with the newest LBR target (bogus trace).");
 }
 
 /// Parse a hex address from \p Str.
@@ -882,11 +880,12 @@ void PerfScriptReader::warnIfMissingMMap() {
 
 // The unwinder requires that LBR tip belong to the leaf frame.
 // External addresses are not checked.
-static bool isValidTrace(ProfiledBinary *Binary, uint64_t StackLeaf,
-                         uint64_t LBRLeaf) {
+static bool isValidTrace(uint64_t StackLeaf, uint64_t LBRLeaf,
+                         const FuncRange *StackRange,
+                         const FuncRange *LBRRange) {
   if (StackLeaf == ExternalAddr || LBRLeaf == ExternalAddr)
     return true;
-  return Binary->findFuncRange(LBRLeaf) == Binary->findFuncRange(StackLeaf);
+  return LBRRange == StackRange;
 }
 
 void HybridPerfReader::parseSample(TraceStream &TraceIt, uint64_t Count) {
@@ -916,16 +915,28 @@ void HybridPerfReader::parseSample(TraceStream &TraceIt, uint64_t Count) {
   if (!TraceIt.isAtEoF() && isLBRSample(TraceIt.getCurrentLine(), true)) {
     // Parsing LBR stack and populate into PerfSample.LBRStack
     if (extractLBRStack(TraceIt, Sample->LBRStack)) {
+      uint64_t StackLeaf = Sample->CallStack.front();
+      uint64_t LBRLeaf = Sample->LBRStack[0].Target;
+      FuncRange *StackRange = Binary->findFuncRange(StackLeaf);
+      FuncRange *LBRRange = Binary->findFuncRange(LBRLeaf);
+      bool IsValid = isValidTrace(StackLeaf, LBRLeaf, StackRange, LBRRange);
+
+      NumTotalHybridSample += Count;
+      if (!IsValid)
+        NumBogusTrace += Count;
+      if (StackRange) {
+        FunctionTraceStats &Stats = FunctionTraceStatsMap[StackRange->Func];
+        Stats.TotalSamples += Count;
+        if (!IsValid)
+          Stats.BogusSamples += Count;
+      }
+
       if (IgnoreStackSamples) {
         Sample->CallStack.clear();
       } else {
-        NumTotalHybridSample++;
         // Drop samples whose callchain and LBR disagree before the
         // canonicalization below hides the disagreement.
-        uint64_t StackLeaf = Sample->CallStack.front();
-        uint64_t LBRLeaf = Sample->LBRStack[0].Target;
-        if (!isValidTrace(Binary, StackLeaf, LBRLeaf)) {
-          NumBogusTrace++;
+        if (!IsValid) {
           if (ShowDetailedWarning)
             WithColor::warning()
                 << "Bogus trace: stack tip = " << format("%#010x", StackLeaf)
@@ -1323,11 +1334,85 @@ PerfContent PerfScriptReader::checkPerfScriptType(StringRef FileName) {
 }
 
 void HybridPerfReader::generateUnsymbolizedProfile() {
+  emitWarningSummary(NumBogusTrace, NumTotalHybridSample,
+                     "of hybrid samples had a callchain leaf that disagreed "
+                     "with the newest LBR target (bogus trace).");
+  warnBogusTraceHotness();
+
   ProfileIsCS = !IgnoreStackSamples;
   if (ProfileIsCS)
     unwindSamples();
   else
     PerfScriptReader::generateUnsymbolizedProfile();
+}
+
+void HybridPerfReader::warnBogusTraceHotness() {
+  if (!NumBogusTrace || FunctionTraceStatsMap.size() < 2)
+    return;
+
+  struct FunctionStatsEntry {
+    const BinaryFunction *Function;
+    FunctionTraceStats Stats;
+  };
+
+  std::vector<FunctionStatsEntry> Entries;
+  Entries.reserve(FunctionTraceStatsMap.size());
+  uint64_t AttributedSamples = 0;
+  uint64_t AttributedBogusSamples = 0;
+  for (const auto &[Function, Stats] : FunctionTraceStatsMap) {
+    Entries.push_back({Function, Stats});
+    AttributedSamples += Stats.TotalSamples;
+    AttributedBogusSamples += Stats.BogusSamples;
+  }
+  if (!AttributedBogusSamples)
+    return;
+  llvm::sort(Entries,
+             [](const FunctionStatsEntry &LHS, const FunctionStatsEntry &RHS) {
+               if (LHS.Stats.TotalSamples != RHS.Stats.TotalSamples)
+                 return LHS.Stats.TotalSamples > RHS.Stats.TotalSamples;
+               return LHS.Function->FuncName < RHS.Function->FuncName;
+             });
+
+  struct HotnessBucket {
+    uint64_t FunctionCount = 0;
+    uint64_t TotalSamples = 0;
+    uint64_t BogusSamples = 0;
+  };
+  std::array<HotnessBucket, 10> HotnessBuckets{};
+  if (AttributedSamples) {
+    uint64_t BucketWidth = divideCeil(AttributedSamples, uint64_t{10});
+    uint64_t CumulativeSamples = 0;
+    for (const FunctionStatsEntry &Entry : Entries) {
+      unsigned Bucket = std::min<uint64_t>(CumulativeSamples / BucketWidth, 9);
+      HotnessBuckets[Bucket].FunctionCount++;
+      HotnessBuckets[Bucket].TotalSamples += Entry.Stats.TotalSamples;
+      HotnessBuckets[Bucket].BogusSamples += Entry.Stats.BogusSamples;
+      CumulativeSamples += Entry.Stats.TotalSamples;
+    }
+  }
+
+  const HotnessBucket *Hottest = nullptr;
+  const HotnessBucket *Coldest = nullptr;
+  for (const HotnessBucket &Bucket : HotnessBuckets) {
+    if (!Bucket.FunctionCount)
+      continue;
+    if (!Hottest)
+      Hottest = &Bucket;
+    Coldest = &Bucket;
+  }
+  if (Hottest == Coldest)
+    return;
+
+  WithColor::warning()
+      << format("%.2f", static_cast<double>(Hottest->BogusSamples) * 100 /
+                            Hottest->TotalSamples)
+      << "%(" << Hottest->BogusSamples << "/" << Hottest->TotalSamples
+      << ") of samples from the hottest cumulative-weight bucket and "
+      << format("%.2f", static_cast<double>(Coldest->BogusSamples) * 100 /
+                            Coldest->TotalSamples)
+      << "%(" << Coldest->BogusSamples << "/" << Coldest->TotalSamples
+      << ") from the coldest cumulative-weight bucket were classified as "
+         "bogus.\n";
 }
 
 void PerfScriptReader::warnTruncatedStack() {
